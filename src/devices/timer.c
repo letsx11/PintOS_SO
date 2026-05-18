@@ -92,13 +92,27 @@ timer_elapsed (int64_t then)
 void
 timer_sleep (int64_t ticks) 
 {
-  int64_t start = timer_ticks ();
+  // validação para evitar que o sistema bloqueie uma thread se o tempo <= 0
+  if (ticks <= 0)
+    return;
 
   ASSERT (intr_get_level () == INTR_ON);
-  // remove a busy wait 
-  if (timer_elapsed (start) < ticks) 
-  {thread_sleep(start + ticks);};
-  
+
+  // pega a thread atual e define o momento do alarme 
+  struct thread *current = thread_current ();
+  current->wakeup_tick = timer_ticks () + ticks;
+
+  // desativa as interrupções para entrar na região crítica 
+  enum intr_level old_level = intr_disable ();
+
+  // coloca a identificação da thread no fim da fila
+  list_push_back (&sleep_list, &current->elem);
+
+  // coloca a thread pra dormir
+  thread_block ();
+
+  // restaura as interrupções desativadas 
+  intr_set_level (old_level);
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -177,6 +191,27 @@ timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
   thread_tick ();
+
+  // começa a olhar a lsleep list a aprtir do primeiro elemento
+  struct list_elem *element = list_begin (&sleep_list);
+  
+  // percorre a lista 
+  while (element != list_end (&sleep_list)){
+    // transforma o elemento da lista na thread real
+    struct thread *t = list_entry (element, struct thread, elem);
+
+    // caso o tempo atual do sistema passe da hora da thread acordar
+    if (ticks >= t->wakeup_tick) {
+      // remove a thread da lista e pega o próximo elemento
+      element = list_remove (element); 
+      // bota a thread no estado ready
+      thread_unblock (t);  
+    }
+    else {
+      // caso não seja a hora dela só vai para a próxima da lista
+      element = list_next (element);   
+    }
+  }
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer

@@ -31,6 +31,15 @@ static bool too_many_loops (unsigned loops);
 static void busy_wait (int64_t loops);
 static void real_time_sleep (int64_t num, int32_t denom);
 static void real_time_delay (int64_t num, int32_t denom);
+static bool compare_ticks(const struct list_elem *a, const struct list_elem *b, void *aux);
+
+static bool // função auxiliar 
+compare_ticks(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+{
+  const struct thread *th_a = list_entry(a, struct thread, elem );
+  const struct thread *th_b = list_entry(b, struct thread, elem );
+  return th_a->wakeup_tick <= th_b->wakeup_tick; 
+}
 
 /* Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
@@ -98,15 +107,16 @@ timer_sleep (int64_t ticks)
 
   ASSERT (intr_get_level () == INTR_ON);
 
+  // desativa as interrupções para entrar na região crítica 
+  enum intr_level old_level = intr_disable ();
+
   // pega a thread atual e define o momento do alarme 
   struct thread *current = thread_current ();
   current->wakeup_tick = timer_ticks () + ticks;
 
-  // desativa as interrupções para entrar na região crítica 
-  enum intr_level old_level = intr_disable ();
 
-  // coloca a identificação da thread no fim da fila
-  list_push_back (&sleep_list, &current->elem);
+  // lista já devidamente ordenada, de modo crescente em relção ao tick
+  list_insert_ordered(&sleep_list, &current->elem, compare_ticks, NULL);
 
   // coloca a thread pra dormir
   thread_block ();
@@ -186,30 +196,26 @@ timer_print_stats (void)
 }
 
 /* Timer interrupt handler. */
-static void
+static void 
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
   thread_tick ();
-
-  // começa a olhar a lsleep list a aprtir do primeiro elemento
-  struct list_elem *element = list_begin (&sleep_list);
   
-  // percorre a lista 
-  while (element != list_end (&sleep_list)){
-    // transforma o elemento da lista na thread real
-    struct thread *t = list_entry (element, struct thread, elem);
+  while (!list_empty(&sleep_list)){
+    struct list_elem *elem = list_begin(&sleep_list);
+    struct thread *t = list_entry(elem, struct thread, elem);
 
-    // caso o tempo atual do sistema passe da hora da thread acordar
-    if (ticks >= t->wakeup_tick) {
-      // remove a thread da lista e pega o próximo elemento
-      element = list_remove (element); 
-      // bota a thread no estado ready
-      thread_unblock (t);  
-    }
-    else {
-      // caso não seja a hora dela só vai para a próxima da lista
-      element = list_next (element);   
+    if (t->wakeup_tick <= ticks) {
+        list_pop_front(&sleep_list);   // remove o primeiro da lista ordenada 
+        thread_unblock(t);             // acorda a thread 
+        if (t->priority > thread_current()->priority)
+        {
+          intr_yield_on_return();
+        }
+        
+    } else {
+        break; 
     }
   }
 }

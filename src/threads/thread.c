@@ -1,4 +1,5 @@
 #include "threads/thread.h"
+#include "devices/timer.h"
 #include <debug.h>
 #include <stddef.h>
 #include <random.h>
@@ -20,6 +21,9 @@
    of thread.h for details. */
 #define THREAD_MAGIC 0xcd6abf4b
 #define A 55
+
+// média de carga do sistema (ponto fixo)
+fixed_t load_avg;
 
 /* List of processes in THREAD_READY state, that is, processes
    that are ready to run but not actually running. */
@@ -82,6 +86,91 @@ compare_priority(const struct list_elem *a, const struct list_elem *b, void *aux
   return th_a->priority > th_b->priority; 
 }
 
+// calcula a prioridade de uma thread de acordo com o mlfqs
+void 
+thread_calculate_priority (struct thread *t) 
+{
+  // segurança: preenche o tempo quando o sistema não tem nada para rodar
+  if (t == idle_thread)
+    return;
+
+  // priority = PRI_MAX - (recent_cpu / 4) - (nice * 2)
+  fixed_t recent_cpu_div_4 = FP_DIV_INT (t->recent_cpu, 4); // divisão de ponto fixxo por inteiro
+  fixed_t term1 = FP_SUB (INT_TO_FP (PRI_MAX), recent_cpu_div_4); // subtração entre dois números em ponto fixo
+  fixed_t priority_fp = FP_SUB_INT (term1, t->nice * 2); // subtração de ponto fixo por inteiro
+  
+  // volta a ser inteiro (arredonda)
+  int priority = FP_TO_INT_ROUND (priority_fp); 
+
+  // garante que nenhuma thread ultrapasse os limites máximose mínimos do sistema
+  if (priority > PRI_MAX) priority = PRI_MAX;
+  if (priority < PRI_MIN) priority = PRI_MIN;
+
+  // esse será o valor que o escalonador vai usar no próximo yield
+  t->priority = priority;
+}
+
+// funções auxiliares
+static void
+update_priority_action (struct thread *t, void *aux UNUSED) 
+{
+  thread_calculate_priority (t);
+}
+
+void
+thread_update_priorities (void) 
+{
+  thread_foreach (update_priority_action, NULL);
+}
+
+// calcula de novo o recent_cpu de uma thread 
+void 
+thread_calculate_recent_cpu (struct thread *t) 
+{
+  // segurança: preenche o tempo quando o sistema não tem nada para rodar
+  if (t == idle_thread)
+    return;
+
+  // trmo da fração: (2 * load_avg) / (2 * load_avg + 1) 
+  fixed_t two_load = FP_MUL_INT (load_avg, 2); // multiplicação de ponto fixo por inteiro
+  fixed_t denom = FP_ADD_INT (two_load, 1); //  adição de ponto fixo com inteiro
+  fixed_t fraction = FP_DIV (two_load, denom); // divisão entre pontos fixos
+  fixed_t mult = FP_MUL (fraction, t->recent_cpu); // multiplicação entre pontos fixos
+  
+  t->recent_cpu = FP_ADD_INT (mult, t->nice);  // salva a soma de ponto fixo com inteiro 
+}
+
+// função auxiliar 
+static void
+update_recent_cpu_action (struct thread *t, void *aux UNUSED) 
+{
+  thread_calculate_recent_cpu (t);
+}
+
+// calcula o load_avg do sistema global 
+void 
+thread_calculate_load_avg (void) 
+{
+  // fórmula bas: load_avg = (59/60) * load_avg + (1/60) * ready_threads
+  int ready_threads = list_size (&ready_list); // threads prontas para rodar
+  if (thread_current () != idle_thread) // adiciona a thread atual na contagem tambem
+    ready_threads++;
+
+  // 59 e 60 sao transformados em pontos fixos e dividimos (59/60) e multiplicamos dois pontos fixos
+  fixed_t term1 = FP_MUL (FP_DIV (INT_TO_FP (59), INT_TO_FP (60)), load_avg);
+  // 1 e 60 sao transformados em pontos fixos e dividimos (1/60) e multiplicamos ponto fixos por inteiro
+  fixed_t term2 = FP_MUL_INT (FP_DIV (INT_TO_FP (1), INT_TO_FP (60)), ready_threads);
+  
+  load_avg = FP_ADD (term1, term2); // somamos os dois termos (dois pontos fixos) e atualizamos load_avg
+}
+
+// função auxiliar
+void
+thread_update_recent_cpus (void) 
+{
+  thread_foreach (update_recent_cpu_action, NULL);
+}
+
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
    general and it is possible in this case only because loader.S
@@ -103,6 +192,9 @@ thread_init (void)
   lock_init (&tid_lock);
   list_init (&ready_list);
   list_init (&all_list);
+
+  // inicia em 0 (ponto fixo)
+  load_avg = INT_TO_FP (0);
 
   /* Set up a thread structure for the running thread. */
   initial_thread = running_thread ();
@@ -145,9 +237,42 @@ thread_tick (void)
   else
     kernel_ticks++;
 
+  /* === INÍCIO DA LÓGICA MLFQS === */
+  if (thread_mlfqs) 
+    {
+      /* 1. Incrementa o recent_cpu da thread atual em 1 a cada tick (se não for a idle) */
+      if (t != idle_thread)
+        t->recent_cpu = FP_ADD_INT (t->recent_cpu, 1);
+
+      int64_t ticks = timer_ticks ();
+
+      /* 2. A cada 1 segundo (100 ticks), atualiza o load_avg e o recent_cpu global */
+      if (ticks % 100 == 0) 
+        {
+          thread_calculate_load_avg ();
+          thread_update_recent_cpus ();
+        }
+
+      /* 3. A cada 4 ticks, recalcula as prioridades e reordena a fila de prontos */
+      if (ticks % 4 == 0) 
+        {
+          thread_update_priorities ();
+          list_sort (&ready_list, compare_priority, NULL);
+        }
+    }
+  /* === FIM DA LÓGICA MLFQS === */
+
   /* Enforce preemption. */
   if (++thread_ticks >= TIME_SLICE)
     intr_yield_on_return ();
+  /* Se a prioridade mudou após o cálculo de 4 ticks, verifica se a thread atual 
+     perdeu o topo da fila e força a troca de contexto caso necessário */
+  else if (thread_mlfqs && !list_empty (&ready_list)) 
+    {
+      struct thread *max_ready = list_entry (list_begin (&ready_list), struct thread, elem);
+      if (max_ready->priority > t->priority)
+        intr_yield_on_return ();
+    }
 }
 
 /* Prints thread statistics. */
@@ -250,6 +375,19 @@ thread_unblock (struct thread *t)
   ASSERT (t->status == THREAD_BLOCKED);
   list_insert_ordered(&ready_list, &t->elem, compare_priority, NULL);
   t->status = THREAD_READY;
+
+  /* Se a thread que acabou de ficar pronta tiver prioridade maior que a atual,
+     força a thread atual a ceder a CPU. */
+  if (thread_current () != idle_thread && t->priority > thread_current ()->priority) 
+    {
+      /* Se estivermos em uma interrupção externa (ex: timer), agenda para depois do retorno.
+         Caso contrário, cede a CPU imediatamente. */
+      if (intr_context ()) 
+        intr_yield_on_return ();
+      else 
+        thread_yield ();
+    }
+
   intr_set_level (old_level);
 }
 
@@ -346,6 +484,9 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
+  if (thread_mlfqs)
+    return;
+
   thread_current ()->priority = new_priority;
 }
 
@@ -358,33 +499,37 @@ thread_get_priority (void)
 
 /* Sets the current thread's nice value to NICE. */
 void
-thread_set_nice (int nice UNUSED) 
+thread_set_nice (int new_nice) 
 {
-  /* Not yet implemented. */
+  struct thread *curr = thread_current ();
+  curr->nice = new_nice;
+  
+  // recalcula a prioridade se o nice mudar
+  thread_calculate_priority (curr);
+  
+  // Cede a CPU se ela perdeu o posto de maior prioridade
+  thread_yield ();
 }
 
 /* Returns the current thread's nice value. */
 int
 thread_get_nice (void) 
 {
-  /* Not yet implemented. */
-  return 0;
+  return thread_current ()->nice;
 }
 
 /* Returns 100 times the system load average. */
 int
 thread_get_load_avg (void) 
 {
-  /* Not yet implemented. */
-  return 0;
+  return FP_TO_INT_ROUND (FP_MUL_INT (load_avg, 100));
 }
 
 /* Returns 100 times the current thread's recent_cpu value. */
 int
 thread_get_recent_cpu (void) 
 {
-  /* Not yet implemented. */
-  return 0;
+  return FP_TO_INT_ROUND (FP_MUL_INT (thread_current ()->recent_cpu, 100));
 }
 
 /* Idle thread.  Executes when no other thread is ready to run.
@@ -474,6 +619,24 @@ init_thread (struct thread *t, const char *name, int priority)
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
   t->magic = THREAD_MAGIC;
+
+  // ve se a flag ta ativa 
+  if (thread_mlfqs) 
+    {
+      // caso a thread que está sendo inicializada for a thread principal (não tem pai)
+      if (t == initial_thread) 
+        {
+          t->nice = 0;
+          t->recent_cpu = INT_TO_FP (0);
+        } 
+      else 
+        {
+          t->nice = thread_current ()->nice;
+          t->recent_cpu = thread_current ()->recent_cpu;
+        }
+      // calcula a prioridade inicial com os valores herdados
+      thread_calculate_priority (t);
+    }
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);

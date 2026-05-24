@@ -237,36 +237,36 @@ thread_tick (void)
   else
     kernel_ticks++;
 
-  /* === INÍCIO DA LÓGICA MLFQS === */
+  // inicio mlfqs: atualiza o recent_cpu e a prioridade de acordo com as regras do mlfqs a cada tick
   if (thread_mlfqs) 
     {
-      /* 1. Incrementa o recent_cpu da thread atual em 1 a cada tick (se não for a idle) */
+      // a cada tick o incrementa o recent_cpu da thread atual (menos a idle_thread)
       if (t != idle_thread)
         t->recent_cpu = FP_ADD_INT (t->recent_cpu, 1);
 
       int64_t ticks = timer_ticks ();
 
-      /* 2. A cada 1 segundo (100 ticks), atualiza o load_avg e o recent_cpu global */
+      // A cada 1 segundo = 100 ticks, atualiza o load_avg e o recent_cpu global
       if (ticks % 100 == 0) 
         {
           thread_calculate_load_avg ();
           thread_update_recent_cpus ();
         }
 
-      /* 3. A cada 4 ticks, recalcula as prioridades e reordena a fila de prontos */
+      // A cada 4 ticks, recalcula as prioridades e reordena a fila de prontos
       if (ticks % 4 == 0) 
         {
           thread_update_priorities ();
           list_sort (&ready_list, compare_priority, NULL);
         }
     }
-  /* === FIM DA LÓGICA MLFQS === */
+  
 
   /* Enforce preemption. */
   if (++thread_ticks >= TIME_SLICE)
     intr_yield_on_return ();
-  /* Se a prioridade mudou após o cálculo de 4 ticks, verifica se a thread atual 
-     perdeu o topo da fila e força a troca de contexto caso necessário */
+    /* caso a prioridade mude após o cálculo de 4 ticks, verifica se a thread atual 
+     perdeu o topo da fila e força a troca de contexto se preciso */
   else if (thread_mlfqs && !list_empty (&ready_list)) 
     {
       struct thread *max_ready = list_entry (list_begin (&ready_list), struct thread, elem);
@@ -377,11 +377,11 @@ thread_unblock (struct thread *t)
   t->status = THREAD_READY;
 
   /* Se a thread que acabou de ficar pronta tiver prioridade maior que a atual,
-     força a thread atual a ceder a CPU. */
+     força a atual a ceder a CPU */
   if (thread_current () != idle_thread && t->priority > thread_current ()->priority) 
     {
-      /* Se estivermos em uma interrupção externa (ex: timer), agenda para depois do retorno.
-         Caso contrário, cede a CPU imediatamente. */
+      /* Se estivermos em uma interrupção externa, agenda para depois do retorno.
+         caso contrário, cede a CPU imediatamente. */
       if (intr_context ()) 
         intr_yield_on_return ();
       else 
